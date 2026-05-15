@@ -1,0 +1,40 @@
+# 민감 파일 — 절대 git에 올리지 않음
+.env
+.env.*
+*.env
+
+# SSH 키
+*.key
+*.pem
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+
+# 자격증명
+credentials
+credentials.json
+*.credentials
+
+# 백업 파일
+*.bak
+
+# OS 생성 파일
+.DS_Store
+Thumbs.db
+
+# 에디터 설정
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node.js
+node_modules/
+.npm/
