@@ -1,6 +1,7 @@
 # 민감 파일 — 절대 git에 올리지 않음
 .env
 .env.*
+.env.local
 *.env
 
 # SSH 키
