@@ -1,0 +1,20 @@
+.stats {
+  display: flex;
+  gap: 24px;
+  margin-top: 12px;
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+}
+
+.value {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.label {
+  font-size: 12px;
+  color: var(--text-muted);
+}

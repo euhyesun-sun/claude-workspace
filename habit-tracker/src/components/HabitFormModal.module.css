@@ -1,0 +1,78 @@
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal {
+  background: var(--card-bg);
+  border-radius: var(--radius);
+  padding: 20px;
+  width: 320px;
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.modal h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.field input[type='text'] {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+}
+
+.field input[type='color'] {
+  width: 48px;
+  height: 32px;
+  border: none;
+  background: none;
+  cursor: pointer;
+}
+
+.buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.buttons button {
+  border: 1px solid var(--border);
+  background: var(--card-bg);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.primary {
+  background: var(--text);
+  color: var(--card-bg);
+  border-color: var(--text);
+}
+
+.primary:disabled,
+.buttons button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
