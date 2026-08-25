@@ -1,0 +1,764 @@
+/* ==================================================
+[공통] 1. 포탈 사용자 ID 조회
+==================================================
+- 의도: 로그인한 유저 정보로 시스템 내부 고유 ID(portal_user_id)를 식별할 때 사용
+- 입력 변수: ${USER_ID} (현재 웹사이트 로그인 세션 유저 ID)
+- 출력 결과: violet.fn_get_group_hierarchy_with_users_new() 등에 입력할 내부 ID
+*/
+
+SELECT
+	user_id
+FROM
+	violet.tb_users_sso_accounts
+WHERE
+	company = 'baroness'
+	AND provider_user_id = '${USER_ID}'
+;
+
+
+/* ==================================================
+[차량 데이터] 2. 실시간 차량 상태 조회
+==================================================
+- 입력 변수: ${PORTAL_USER_ID.results[0][0]} ('포탈 사용자 ID 조회' 쿼리 결과로 나온 포탈 유저 ID)
+- 주요 로직: 
+  1. 유저 권한 계층(Hierarchy)에 속한 차량 및 View Only 차량 식별
+  2. 가장 최근 수집된 데이터 시간과 현재 시간을 비교하여 10초 이내 데이터면 'online', 지났으면 'offline' 처리
+  3. 시차(Timezone)를 고려하여 현지 수집 시간 계산
+- 출력 컬럼 안내:
+  - op_mode: 차량 작동 모드 (오프라인 시 '-')
+  - condition / check: 실시간 온/오프라인 상태 (online / offline)
+  - notes / note: 보기 권한만 있는 차량은 'View Only' 표시
+*/
+
+WITH device_user AS (
+    SELECT sensor_id, user_id, 'user' AS src
+    FROM violet.v_tb_device_user
+    WHERE user_id IN (
+        SELECT user_id
+        FROM violet.fn_get_group_hierarchy_with_users_new('${PORTAL_USER_ID.results[0][0]}')
+    )
+    UNION ALL
+    SELECT sensor_id, user_id, 'exc' AS src
+    FROM violet.tb_device_user_exc
+    WHERE user_id = '${PORTAL_USER_ID.results[0][0]}'
+),
+collect_info AS (
+    SELECT
+        ci.vehicle_id,
+        MAX(ci.last_collect_datetime) FILTER (WHERE ci.topic = 'condition') AS last_condition_dt,
+        MAX(ci.last_collect_datetime) FILTER (WHERE ci.topic = 'log') AS last_log_dt
+    FROM public.bms_collect_info ci
+      JOIN device_user du
+      ON du.sensor_id = ci.vehicle_id
+    GROUP BY ci.vehicle_id
+),
+latest_condition AS (
+    SELECT
+        c.collect_datetime,
+        COALESCE(c.timezone, 9) as timezone,
+        c.vehicle_id,
+        c.op_mode_m AS op_mode
+    FROM bms_condition c
+    JOIN collect_info ci
+      ON ci.vehicle_id = c.vehicle_id
+      AND ci.last_condition_dt = c.collect_datetime
+),
+latest_log AS (
+    SELECT
+        l.vehicle_id,
+        l.eg_time,
+        l.uman_time
+    FROM bms_log l
+    JOIN collect_info ci
+      ON ci.vehicle_id = l.vehicle_id
+      AND ci.last_log_dt = l.collect_datetime
+),
+user_groups AS (
+    SELECT
+        du.sensor_id AS sensor_id,
+        gm.group_nm AS group_nm,
+        du.user_id
+    FROM violet.tb_device_user du
+    LEFT JOIN violet.tb_users u
+      ON du.user_id = u.user_id
+    LEFT JOIN violet.tb_group_mgmt gm
+      ON u.group_id::int = gm.id
+    WHERE du.user_id IN (
+        SELECT user_id
+        FROM violet.tb_users
+        WHERE role_id = 'ROLE_GROUP'
+    )
+)
+SELECT DISTINCT
+    (b.collect_datetime + (COALESCE(b.timezone, 9) || ' hours')::INTERVAL) AS collect_datetime,
+    CASE
+        WHEN (b.collect_datetime AT TIME ZONE 'UTC') < now() - INTERVAL '10 seconds' THEN '-'
+        ELSE b.op_mode
+        END AS op_mode,
+    b.vehicle_id AS sensor_id,
+    v.specification,
+    ug.group_nm,
+    l.eg_time,
+    l.uman_time,
+    CASE
+        WHEN (b.collect_datetime AT TIME ZONE 'UTC') >= now() - INTERVAL '10 seconds' THEN 'online'
+        ELSE 'offline'
+        END AS condition,
+    CASE
+        WHEN (b.collect_datetime AT TIME ZONE 'UTC') >= now() - INTERVAL '10 seconds' THEN 'online'
+        ELSE 'offline'
+    END AS check,
+    (b.collect_datetime + (COALESCE(b.timezone, 9) || ' hours')::INTERVAL) AS data_time,
+    b.vehicle_id,
+    CASE WHEN BOOL_OR(du.src = 'exc') THEN 'View Only' ELSE '' END AS notes,
+    CASE WHEN BOOL_OR(du.src = 'exc') THEN 'View Only' ELSE '' END AS note
+FROM latest_condition b
+LEFT JOIN vehicle_info v
+  ON b.vehicle_id = v.vehicle_id
+LEFT JOIN latest_log l
+  ON b.vehicle_id = l.vehicle_id
+LEFT JOIN user_groups ug
+  ON b.vehicle_id = ug.sensor_id
+LEFT JOIN device_user du
+  ON b.vehicle_id = du.sensor_id
+GROUP BY
+    b.collect_datetime, COALESCE(b.timezone, 9), b.op_mode, b.vehicle_id,
+    v.specification,
+    ug.group_nm,
+    l.eg_time, l.uman_time
+;
+    
+    
+ /* ==================================================
+[차량 상세] 3. 특정 차량 정보 및 위치/통계 상세 조회
+==================================================
+- 입력 변수: 
+  - ${vehicle_id}: 선택한 차량 고유 ID
+  - ${data_time}: 기준 조회 일시
+  - ${date_time_range_picker_1.startDate / endDate}: 조회 시작/종료 시간 범위
+*/
+
+-- --------------------------------------------------
+-- [지도] 3-1. 차량의 마지막 수집 위치 조회
+-- 로직: 기준 시간(${data_time}) 전후 1분 이내의 최신 위경도 데이터 1건 추출
+-- --------------------------------------------------
+SELECT 
+    collect_datetime + (COALESCE(timezone, 9) || ' hours')::interval AS collect_datetime,
+    lat, lon
+FROM bms_condition
+WHERE
+    vehicle_id = '${vehicle_id}'
+    AND lat IS NOT NULL AND lon IS NOT NULL
+    AND lat <> 0 AND lon <> 0
+    AND collect_datetime
+        BETWEEN '${data_time}'::timestamp - (COALESCE(timezone, 9)::text || ' hours')::interval - INTERVAL '1 minutes'
+        AND     '${data_time}'::timestamp - (COALESCE(timezone, 9)::text || ' hours')::interval + INTERVAL '1 minutes'
+ORDER BY collect_datetime DESC
+LIMIT 1
+;
+
+-- --------------------------------------------------
+-- [지도] 3-2. 특정 기간 차량 이동 경로 조회
+-- --------------------------------------------------
+SELECT
+    collect_datetime + (COALESCE(timezone, 9) || ' hours')::interval AS collect_datetime,
+    lat, lon
+FROM bms_condition
+WHERE
+    vehicle_id = '${vehicle_id}'
+    AND lat IS NOT NULL AND lon IS NOT NULL
+    AND lat <> 0 AND lon <> 0
+    AND collect_datetime >= '${date_time_range_picker_1.startDate}'::timestamp - (COALESCE(timezone, 9) || ' hours')::interval
+    AND collect_datetime <= '${date_time_range_picker_1.endDate}'::timestamp - (COALESCE(timezone, 9) || ' hours')::interval
+ORDER BY collect_datetime ASC
+;
+
+-- --------------------------------------------------
+-- [지도] 3-3. 차량의 이전 위치 조회
+-- --------------------------------------------------
+SELECT 
+    collect_datetime + (COALESCE(timezone, 9) || ' hours')::interval AS collect_datetime,
+    lat, lon
+FROM bms_condition
+WHERE
+    vehicle_id = '${vehicle_id}'
+    AND lat IS NOT NULL AND lon IS NOT NULL
+    AND lat <> 0 AND lon <> 0
+    AND collect_datetime
+        BETWEEN '${before}'::timestamp - (COALESCE(timezone, 9)::text || ' hours')::interval - INTERVAL '1 minutes'
+        AND     '${before}'::timestamp - (COALESCE(timezone, 9)::text || ' hours')::interval + INTERVAL '1 minutes'
+ORDER BY collect_datetime DESC
+LIMIT 1
+;
+
+-- --------------------------------------------------
+-- [테이블] 3-4. 차량 상태 상세 정보 테이블 조회
+-- 출력 주요 데이터: 운전/시스템모드, 연료잔량(fuel_lv), 속도(sog), 재생진행도(pb_prg), 경고내용(alert_m) 등
+-- --------------------------------------------------
+SELECT 
+	collect_datetime + (COALESCE(timezone, 9) || ' hours')::interval as collect_datetime, 
+	op_mode_m as op_mode, 
+	sys_mode_m as sys_mode, 
+	uni_posi_m as uni_posi,  
+	fuel_lv, 
+	sog, 
+	pb_data, 
+	pb_prg, 
+	pb_est, 
+	alert_m, 
+	lat, 
+	lon
+FROM bms_condition
+WHERE 
+	vehicle_id = '${vehicle_id}'
+	AND collect_datetime 
+		BETWEEN ('${data_time}'::timestamp - (COALESCE(timezone, 9)::text || ' hours')::interval) - INTERVAL '1 minutes'
+        AND ('${data_time}'::timestamp - (COALESCE(timezone, 9)::text || ' hours')::interval) + INTERVAL '1 minutes'
+ORDER BY collect_datetime DESC
+LIMIT 1
+;
+
+-- --------------------------------------------------
+-- [차트] 3-5. 분 단위 차량 핵심 데이터 시계열 차트 생성
+-- 로직: 설정된 기간 동안 데이터가 없는 분(Minute) 단위 영역도 0값으로 채우도록 generate_series 선행 결합
+-- --------------------------------------------------
+SELECT 
+	DataTime, 
+	sum(fuel_lv) as fuel_lv, 
+	sum(sog) as sog, 
+	sum(pb_prg) as pb_prg, 
+	sum(pb_est) as pb_est
+FROM (
+	SELECT 
+		generate_series(
+			TIMESTAMP '${date_time_range_picker_1.startDate}',
+			TIMESTAMP '${date_time_range_picker_1.endDate}', 
+			INTERVAL '1 minute'
+		) as DataTime, 
+		0 as fuel_lv, 0 as sog, 0 as pb_prg, 0 as pb_est
+	UNION ALL 
+	SELECT 
+		(collect_datetime + (COALESCE(timezone, 9) || ' hours')::interval) as DataTime, 
+		max(fuel_lv) as fuel_lv, 
+		max(sog) as sog, 
+		max(pb_prg) as pb_prg, 
+		max(pb_est) as pb_est
+	FROM bms_condition
+	WHERE 
+		collect_datetime >= ('${date_time_range_picker_1.startDate}'::timestamp - (COALESCE(timezone, 9)::text || ' hours')::interval)
+		AND collect_datetime <= ('${date_time_range_picker_1.endDate}'::timestamp - (COALESCE(timezone, 9)::text || ' hours')::interval)
+		AND vehicle_id = '${vehicle_id}'
+	GROUP BY collect_datetime, COALESCE(timezone, 9)
+	) a
+GROUP BY DataTime
+ORDER BY DataTime
+;
+
+/* ==================================================
+[참조 딕셔너리] 3-6. 로그 데이터 항목의 다국어(한글/영어 등) 컬럼 매핑 가이드
+==================================================
+- 용도: 사용자가 한글로 특정 항목을 물었을 때, 챗봇이 아래 JSON 정보를 바탕으로 매핑 컬럼명(${hidden_4})을 매칭하기 위함.
+- 예시: 유저가 "가동 시간 차트 보여줘" 라고 하면 챗봇은 "eg_time"을 인지하고 아래 동적 로그 차트 쿼리를 수행해야 함.
+*/
+
+-- [기본 정보 항목 딕셔너리 데이터]
+/*
+{
+  "fields": [
+    {"name": "항목", "type": "TEXT"},
+    {"name": "항목컬럼명", "type": "TEXT"}
+  ],
+  "results": [
+    ["eg_time", "{% if locale == 'ja' %}稼働時間{% elif locale == 'de' %}Betriebsstunden{% elif locale == 'ko' %}작동 시간{% else %}Operating Hours{% endif %}"],
+    ["mow_time", "{% if locale == 'ja' %}モア正転時間{% elif locale == 'de' %}Mähzeit{% elif locale == 'ko' %}MOW 시간{% else %}Mow Time{% endif %}"],
+    ["reel_mt", "{% if locale == 'ja' %}モア逆転時間{% elif locale == 'de' %}Rückwärtslaufzeit des Mähers{% elif locale == 'ko' %}모어 역회전 시간{% else %}Mower Reverse Rotation Time{% endif %}"],
+    ["uman_time", "{% if locale == 'ja' %}無人稼働時間{% elif locale == 'de' %}Unbeaufsichtigte Betriebszeit{% elif locale == 'ko' %}무인 가동 시간{% else %}Unmanned Operation Time{% endif %}"],
+    ["uman_reel", "{% if locale == 'ja' %}無人刈込時間{% elif locale == 'de' %}Unbemannte Mähzeit{% elif locale == 'ko' %}무인 절단 시간{% else %}Unmanned Mowing Time{% endif %}"],
+    ["wk_area", "{% if locale == 'ja' %}刈り込み面積{% elif locale == 'de' %}Mähbereich{% elif locale == 'ko' %}깎는 면적{% else %}Mowing Area{% endif %}"],
+    ["op_mode", "{% if locale == 'ja' %}オペレーションモード{% elif locale == 'de' %}Betriebsmodus{% elif locale == 'ko' %}작동 모드{% else %}Operation Mode{% endif %}"],
+    {#
+    ["pb_data", "{% if locale == 'ja' %}プレイバックデータ{% elif locale == 'de' %}Wiedergabedaten{% elif locale == 'ko' %}재생 데이터{% else %}Playback Data{% endif %}"],
+    #}
+    ["pb_prg", "{% if locale == 'ja' %}進行度{% elif locale == 'de' %}Fortschritt{% elif locale == 'ko' %}진행도{% else %}Progress{% endif %}"],
+    ["pb_est", "{% if locale == 'ja' %}終了予測時間{% elif locale == 'de' %}Geschätzte Endzeit{% elif locale == 'ko' %}예상 종료 시간{% else %}Estimated End Time{% endif %}"],
+    ["sys_mode", "{% if locale == 'ja' %}動作モード{% elif locale == 'de' %}Betriebsmodus{% elif locale == 'ko' %}동작 모드{% else %}System Mode{% endif %}"],
+    ["uni_posi", "{% if locale == 'ja' %}ユニットポジション{% elif locale == 'de' %}Geräteposition{% elif locale == 'ko' %}유닛 위치{% else %}Unit Position{% endif %}"],
+    ["fuel_lv", "{% if locale == 'ja' %}燃料残量{% elif locale == 'de' %}Verbleibender Kraftstoff{% elif locale == 'ko' %}남은 연료{% else %}Fuel Remaining{% endif %}"],
+    ["eg_fuelcons", "{% if locale == 'ja' %}燃料消費率{% elif locale == 'de' %}Kraftstoffverbrauchsrate{% elif locale == 'ko' %}연료 소비율{% else %}Fuel Consumption Rate{% endif %}"],
+    ["fuel_cons", "{% if locale == 'ja' %}燃料使用量{% elif locale == 'de' %}Kraftstoffverbrauch{% elif locale == 'ko' %}연료 사용량{% else %}Fuel Consumption{% endif %}"],
+    ["bt_volt", "{% if locale == 'ja' %}電圧{% elif locale == 'de' %}Spannung{% elif locale == 'ko' %}전압{% else %}Voltage{% endif %}"],
+    ["eg_wtemp", "{% if locale == 'ja' %}水温{% elif locale == 'de' %}Wassertemperatur{% elif locale == 'ko' %}수온{% else %}Water Temperature{% endif %}"],
+    ["sog", "{% if locale == 'ja' %}速度{% elif locale == 'de' %}Geschwindigkeit{% elif locale == 'ko' %}속도{% else %}Speed{% endif %}"],
+    ["err_code", "{% if locale == 'ja' %}エラーコード{% elif locale == 'de' %}Fehlercode{% elif locale == 'ko' %}오류 코드{% else %}Error Code{% endif %}"],
+    ["quality", "{% if locale == 'ja' %}GNSSステータス{% elif locale == 'de' %}GNSS Status{% elif locale == 'ko' %}GNSS 상태{% else %}GNSS Status{% endif %}"],
+    ["head_type", "{% if locale == 'ja' %}方位タイプ{% elif locale == 'de' %}Orientierungstyp{% elif locale == 'ko' %}방위 타입{% else %}Orientation Type{% endif %}"],
+    ["num_sv", "{% if locale == 'ja' %}衛星数{% elif locale == 'de' %}Anzahl Der Satelliten{% elif locale == 'ko' %}위성 수{% else %}Number Of Satellites{% endif %}"],
+    ["age", "{% if locale == 'ja' %}AGE{% elif locale == 'de' %}Alter{% elif locale == 'ko' %}나이{% else %}Age{% endif %}"],
+    ["hdop", "Hdop"],
+    ["slam_enb", "{% if locale == 'ja' %}SLAM状態{% elif locale == 'de' %}SLAM Status{% elif locale == 'ko' %}SLAM 상태{% else %}SLAM Status{% endif %}"]
+  ]
+}*/
+
+-- [확장 정보 항목 딕셔너리 데이터]
+/*
+{
+  "fields": [
+    {"name": "항목", "type": "TEXT"},
+    {"name": "항목컬럼명", "type": "TEXT"}
+  ],
+  "results": [
+  ["roll", "{% if locale == 'ja' %}ロール角{% elif locale == 'de' %}Rollwinkel{% elif locale == 'ko' %}롤 각도{% else %}Roll Angle{% endif %}"],
+  ["pitch", "{% if locale == 'ja' %}ピッチ角{% elif locale == 'de' %}Pitch Winkel{% elif locale == 'ko' %}피치 각도{% else %}Pitch Angle{% endif %}"],
+  ["ster_ins", "{% if locale == 'ja' %}舵角指令値{% elif locale == 'de' %}Ruderwinkel Anweisungswert{% elif locale == 'ko' %}타각 지시값{% else %}Rudder Angle Instruction Value{% endif %}"],
+  ["ster_fb", "{% if locale == 'ja' %}舵角フィードバック値{% elif locale == 'de' %}Wert Der Rückmeldung Des Ruderwinkels{% elif locale == 'ko' %}타각 피드백 값{% else %}Rudder Angle Feedback Value{% endif %}"],
+  ["soot_perc", "{% if locale == 'ja' %}すす％{% elif locale == 'de' %}Rußprozentsatz{% elif locale == 'ko' %}매연 비율{% else %}Soot Percentage{% endif %}"],
+  ["eg_hyd", "{% if locale == 'ja' %}エンジン油圧{% elif locale == 'de' %}Motoröldruck{% elif locale == 'ko' %}엔진 유압{% else %}Engine Oil Pressure{% endif %}"],
+  ["eg_dmtorq", "{% if locale == 'ja' %}要求エンジントルク{% elif locale == 'de' %}Angefordertes Motordrehmoment{% elif locale == 'ko' %}요구 엔진 토크{% else %}Requested Engine Torque{% endif %}"],
+  ["eg_torq", "{% if locale == 'ja' %}エンジントルク{% elif locale == 'de' %}Motordrehmoment{% elif locale == 'ko' %}엔진 토크{% else %}Engine Torque{% endif %}"],
+  ["eg_lfac", "{% if locale == 'ja' %}負荷率{% elif locale == 'de' %}Lastfaktor{% elif locale == 'ko' %}부하율{% else %}Load Factor{% endif %}"],
+  ["eg_rpm", "{% if locale == 'ja' %}エンジン回転数{% elif locale == 'de' %}Motordrehzahl{% elif locale == 'ko' %}엔진 속도{% else %}Engine Speed{% endif %}"],
+  ["trv_ins", "{% if locale == 'ja' %}アクセル指示値{% elif locale == 'de' %}Gaspedal Sollwert{% elif locale == 'ko' %}가속기 지시값{% else %}Accelerator Command Value{% endif %}"],
+  ["trv_fb", "{% if locale == 'ja' %}アクセルフィードバック値{% elif locale == 'de' %}Gaspedal Rückmeldungswert{% elif locale == 'ko' %}가속기 피드백 값{% else %}Accelerator Feedback Value{% endif %}"],
+  ["eg_acel1", "{% if locale == 'ja' %}アクセル開度1{% elif locale == 'de' %}Gaspedalöffnung1{% elif locale == 'ko' %}가속 개도1{% else %}Accelerator Opening1{% endif %}"],
+  ["eg_dmrpm", "{% if locale == 'ja' %}エンジン指示速度{% elif locale == 'de' %}Motor Sollgeschwindigkeit{% elif locale == 'ko' %}엔진 지시 속도{% else %}Engine Command Speed{% endif %}"],
+  ["eg_thtop", "{% if locale == 'ja' %}スロットル開度{% elif locale == 'de' %}Drosselklappenöffnung{% elif locale == 'ko' %}스로틀 개도{% else %}Throttle Opening{% endif %}"],
+  ["eg_boost", "{% if locale == 'ja' %}ブースト圧{% elif locale == 'de' %}Ladedruck{% elif locale == 'ko' %}부스트 압력{% else %}Boost Pressure{% endif %}"],
+  ["atms_press", "{% if locale == 'ja' %}気圧{% elif locale == 'de' %}Atmosphärischer Druck{% elif locale == 'ko' %}기압{% else %}Atmospheric Pressure{% endif %}"],
+  ["oside_temp", "{% if locale == 'ja' %}外気温{% elif locale == 'de' %}Außentemperatur{% elif locale == 'ko' %}외기 온도{% else %}Outside Temperature{% endif %}"],
+  ["inm_temp", "{% if locale == 'ja' %}吸気マニホールド温{% elif locale == 'de' %}Ansaugkrümmertemperatur{% elif locale == 'ko' %}흡기 매니폴드 온도{% else %}Intake Manifold Temperature{% endif %}"],
+  ["inair_temp", "{% if locale == 'ja' %}吸入空気温度{% elif locale == 'de' %}Ansauglufttemperatur{% elif locale == 'ko' %}흡입 공기 온도{% else %}Intake Air Temperature{% endif %}"],
+  ["rail_press", "{% if locale == 'ja' %}インジェクタレール圧{% elif locale == 'de' %}Injektor Rail Druck{% elif locale == 'ko' %}인젝터 레일 압력{% else %}Injector Rail Pressure{% endif %}"],
+  ["inair_vol", "{% if locale == 'ja' %}吸入空気量{% elif locale == 'de' %}Ansaugluftmenge{% elif locale == 'ko' %}흡입 공기량{% else %}Intake Air Volume{% endif %}"],
+  ["doc_temp", "{% if locale == 'ja' %}DOC温度{% elif locale == 'de' %}DOC Temperatur{% elif locale == 'ko' %}DOC 온도{% else %}DOC Temperature{% endif %}"],
+  ["dpf_temp1", "{% if locale == 'ja' %}排気フィルター入口温度{% elif locale == 'de' %}Abgasfilter Eintrittstemperatur{% elif locale == 'ko' %}배기 필터 입구 온도{% else %}Exhaust Filter Inlet Temperature{% endif %}"],
+  ["dpf_temp2", "{% if locale == 'ja' %}排気フィルター出口温度{% elif locale == 'de' %}Abgasfilter Austrittstemperatur{% elif locale == 'ko' %}배기 필터 출구 온도{% else %}Exhaust Filter Outlet Temperature{% endif %}"],
+  ["dpf_difp", "{% if locale == 'ja' %}DPF差圧{% elif locale == 'de' %}DPF Differenzdruck{% elif locale == 'ko' %}DPF 차압{% else %}DPF Differential Pressure{% endif %}"],
+  ["dpf_lv", "{% if locale == 'ja' %}DPFステータス{% elif locale == 'de' %}DPF Status{% elif locale == 'ko' %}DPF 상태{% else %}DPF Status{% endif %}"],
+  ["dpf_st", "{% if locale == 'ja' %}DPF活性的再生状況{% elif locale == 'de' %}DPF Aktiver Regenerationsstatus{% elif locale == 'ko' %}DPF 활성 재생 상태{% else %}DPF Active Regeneration Status{% endif %}"],
+  ["reg_st", "{% if locale == 'ja' %}DPF再生禁止ステータス{% elif locale == 'de' %}DPF Regenerationssperrstatus{% elif locale == 'ko' %}DPF 재생 금지 상태{% else %}DPF Regeneration Inhibit Status{% endif %}"],
+  ["reg_sw", "{% if locale == 'ja' %}DPF再生禁止SW{% elif locale == 'de' %}DPF Regenerationsverbot SW{% elif locale == 'ko' %}DPF 재생 금지 SW{% else %}DPF Regeneration Prohibition SW{% endif %}"]
+]
+}*/
+
+-- --------------------------------------------------
+-- [차트] 3-7. 선택된 컬럼들(${hidden_4})에 대한 동적 로그 데이터 조회
+-- 의도: "선택한 로그 항목들의 시간에 따른 변화 이력 조회"
+-- 특이사항: dpf_st 컬럼의 경우 '1'인 데이터만 가중치를 두어 1, 아니면 0으로 변환하는 특수 분기 로직 포함.
+-- --------------------------------------------------
+SELECT
+    to_char(DataTime, 'YYYY-MM-DD HH24:MI:SS') AS "Data Time"
+    {% for col in hidden_4.split(',') %}
+    , "{{ col }}"
+    {% endfor %}
+FROM (
+    SELECT
+        (collect_datetime + (COALESCE(timezone, 9) || ' hours')::interval) AS DataTime
+        {% for col in hidden_4.split(',') %}
+        , {% if col == 'dpf_st' %}
+          CASE WHEN {{ col }} = '1' THEN 1 ELSE 0 END AS "{{ col }}"
+          {% else %}
+          {{ col }} AS "{{ col }}"
+          {% endif %}
+        {% endfor %}
+    FROM bms_log
+    WHERE
+        vehicle_id = '${vehicle_id}'
+        AND collect_datetime >= '${date_time_range_picker_1.startDate}'::timestamp - (COALESCE(timezone, 9) || ' hours')::interval
+        AND collect_datetime <= '${date_time_range_picker_1.endDate}'::timestamp - (COALESCE(timezone, 9) || ' hours')::interval
+) a
+ORDER BY DataTime;
+
+
+/* ==================================================
+[경고 목록] 4. 차량 경고 내역 조회
+==================================================
+- 입력 변수: ${PORTAL_USER_ID.results[0][0]} (사용자 세션 기반 포탈 유저 ID)
+- 주요 로직:
+  1. 유저 권한 계층에 속한 차량 정보와 View Only 차량 정보를 병합 (device_user)
+  2. 수집된 토픽 중 'alert' 관련 데이터의 최신 수집 시간 추출 (collect_info)
+  3. 경고 메시지(alert_m)가 비어있지 않거나 'null' 문자열이 아닌 유효한 데이터만 필터링 (latest_alert)
+  4. 시차(Timezone)를 반영하여 수집 일시를 현지 시간으로 보정하여 출력
+- 출력 컬럼 안내:
+  - alert / alert_m: 발생한 경고/알림 메시지 내용 (빈 값이나 null 제외됨)
+  - op_mode_m: 경고 발생 당시의 차량 작동 모드
+  - notes / note: 보기 권한만 있는 차량은 'View Only' 표시
+*/
+
+WITH device_user AS (
+    SELECT sensor_id, user_id, 'user' AS src
+    FROM violet.v_tb_device_user
+    WHERE user_id IN (
+        SELECT user_id
+        FROM violet.fn_get_group_hierarchy_with_users_new('${PORTAL_USER_ID.results[0][0]}')
+    )
+    UNION ALL
+    SELECT sensor_id, user_id, 'exc' AS src
+    FROM violet.tb_device_user_exc
+    WHERE user_id = '${PORTAL_USER_ID.results[0][0]}'
+),
+collect_info AS (
+	SELECT
+		vehicle_id, last_collect_datetime
+	FROM public.bms_collect_info ci
+    JOIN device_user du
+      ON du.sensor_id = ci.vehicle_id
+      AND ci.topic = 'alert'
+    GROUP BY ci.vehicle_id, ci.last_collect_datetime
+),
+latest_alert AS (
+    SELECT
+        a.collect_datetime, COALESCE(a.timezone, 9) as timezone,
+        a.op_mode_m,
+        a.vehicle_id,
+        a.alert_m
+    FROM bms_alert a
+    JOIN collect_info ci
+      ON ci.vehicle_id = a.vehicle_id
+      AND ci.last_collect_datetime = a.collect_datetime
+    WHERE 
+    	a.alert_m <> '' AND a.alert_m <> 'null'
+),
+user_group AS (
+    SELECT
+        du.sensor_id AS sensor_id,
+        gm.group_nm AS group_nm,
+        du.user_id
+    FROM violet.tb_device_user du
+    LEFT JOIN violet.tb_users u
+      ON du.user_id = u.user_id
+    LEFT JOIN violet.tb_group_mgmt gm
+      ON u.group_id::int = gm.id
+    WHERE du.user_id IN (
+        SELECT user_id
+        FROM violet.tb_users
+        WHERE role_id = 'ROLE_GROUP'
+    )
+)
+
+SELECT DISTINCT
+    (b.collect_datetime + (COALESCE(b.timezone, 9) || ' hours')::INTERVAL) AS collect_datetime,
+    b.op_mode_m AS op_mode_m,
+    b.vehicle_id as vehicle,
+    ug.group_nm as group,
+    b.alert_m as alert_m, b.alert_m as alert,
+    CASE WHEN du.src = 'exc' THEN 'View Only' ELSE '' END AS notes,
+    (b.collect_datetime + (COALESCE(b.timezone, 9) || ' hours')::INTERVAL) as data_time,
+    b.vehicle_id as vehicle_id,
+    ug.group_nm as group_nm,    
+    CASE WHEN du.src = 'exc' THEN 'View Only' ELSE '' END AS note
+FROM latest_alert b
+LEFT JOIN user_group ug
+  ON b.vehicle_id = ug.sensor_id
+LEFT JOIN device_user du
+  ON b.vehicle_id = du.sensor_id
+;
+  
+  
+/* ==================================================
+[경고 상세] 5. 선택한 경고 알림의 세부 정보 조회
+==================================================
+- 입력 변수:
+  - ${vehicle_id}: 선택한 차량 고유 ID
+  - ${slt_event_dt}: 유저가 클릭하거나 선택한 경고 발생 시점 (이벤트 일시)
+  - ${alert} 또는 ${alert_m}: 확인할 특정 경고 메시지 내용
+*/
+
+-- --------------------------------------------------
+-- [테이블] 5-1. 경고 발생 순간의 차량 기본 상태 정보
+-- 로직: 경고 발생 시점(${slt_event_dt}) 전후 1초 이내의 가장 최신 bms_alert 데이터 1건 추출
+-- --------------------------------------------------
+SELECT 
+	(collect_datetime + (COALESCE(timezone, 9) || ' hours')::interval) as collect_datetime, 
+	op_mode_m as op_mode, 
+	sys_mode_m as sys_mode, 
+	uni_posi_m as uni_posi,  
+	fuel_lv, 
+	sog, 
+	pb_data, 
+	pb_prg, 
+	pb_est, 
+	alert_m, 
+	lat, 
+	lon
+FROM bms_alert
+WHERE 
+	collect_datetime
+		BETWEEN '${slt_event_dt}'::timestamp - (COALESCE(timezone, 9) || ' hours')::interval - INTERVAL '1 seconds' 
+		AND  '${slt_event_dt}'::timestamp - (COALESCE(timezone, 9) || ' hours')::interval + INTERVAL '1 seconds'
+	AND vehicle_id = '${vehicle_id}'
+	AND alert_m = '${alert}'
+	AND alert_m <> '' and alert_m <> 'null'
+ORDER BY collect_datetime DESC
+LIMIT 1
+;
+
+-- --------------------------------------------------
+-- [테이블] 5-2. 경고 발생 순간의 하드웨어/제어계 상세 정보
+-- 출력 주요 데이터: 엔진속도(eg_rpm), 기울기(roll, pitch), 위성수(num_sv), 전압(bt_volt), 타각지시/피드백(ster_ins, ster_fb) 등
+-- --------------------------------------------------
+SELECT 
+	(collect_datetime + (COALESCE(timezone, 9) || ' hours')::interval) as collect_datetime,
+	eg_time, 
+	eg_rpm, 
+	roll, 
+	pitch, 
+	oside_temp, 
+	quality_m as quality, 
+	head_type_m as head_type,  
+	num_sv, 
+	age, 
+	hdop, 
+	bt_volt, 
+	eg_wtemp, 
+	ster_ins, 
+	ster_fb, 
+	trv_ins, 
+	trv_fb 
+FROM bms_alert
+WHERE 
+	collect_datetime 
+		BETWEEN '${slt_event_dt}'::timestamp - (COALESCE(timezone, 9) || ' hours')::interval - INTERVAL '1 seconds' 
+		AND  '${slt_event_dt}'::timestamp - (COALESCE(timezone, 9) || ' hours')::interval + INTERVAL '1 seconds'
+	AND vehicle_id = '${vehicle_id}'
+	AND alert_m = '${alert}'
+	AND alert_m <> '' and alert_m <> 'null'
+ORDER BY collect_datetime DESC
+LIMIT 1
+;
+
+-- --------------------------------------------------
+-- [테이블] 5-3. 이 차량에서 발생한 전체 경고 이력 타임라인 (중복 제거)
+-- 로직: 
+--   1. 초(Second) 단위로 자른 시간과 경고 메시지 조합(`PARTITION BY`)으로 그룹핑
+--   2. 동일한 초에 동일한 경고가 여러 번 중복 수집된 경우, 가장 최신의 데이터(`rn = 1`)만 남기고 필터링
+-- --------------------------------------------------
+WITH base AS (
+  SELECT
+    date_trunc(
+      'second',
+      collect_datetime + (COALESCE(timezone, 9) || ' hours')::interval
+    ) AS collect_dt_sec,
+    (collect_datetime + (COALESCE(timezone, 9) || ' hours')::interval) AS event_dt,
+    lat,
+    lon,
+    alert_m,
+    ROW_NUMBER() OVER (
+      PARTITION BY
+        date_trunc(
+          'second',
+          collect_datetime + (COALESCE(timezone, 9) || ' hours')::interval
+        ),
+        alert_m
+      ORDER BY (collect_datetime + (COALESCE(timezone, 9) || ' hours')::interval) DESC
+    ) AS rn
+  FROM bms_alert
+  WHERE vehicle_id = '${vehicle_id}'
+    AND alert_m <> ''
+    AND alert_m <> 'null'
+)
+
+SELECT
+  collect_dt_sec AS "{% if locale == 'ja' %}データ時間{% elif locale == 'de' %}Datenzeit{% elif locale == 'ko' %}데이터 시간{% else %}Data Time{% endif %}",
+  alert_m        AS "{% if locale == 'ja' %}警告メッセージ{% elif locale == 'de' %}Warnmeldung{% elif locale == 'ko' %}경고 메시지{% else %}Alert Message{% endif %}",
+  event_dt,
+  lat,
+  lon,
+  alert_m AS alert_msg_raw
+FROM base
+WHERE rn = 1
+ORDER BY collect_dt_sec DESC
+;
+
+
+/* ==================================================
+[차량 관리] 6. 전체 차량 목록 및 소속 그룹 조회
+==================================================
+- 입력 변수: ${PORTAL_USER_ID.results[0][0]} (로그인 유저의 포탈 고유 ID)
+- 로직: 
+  1. 유저 하위 계층 그룹에 매핑된 차량 목록 추출
+  2. 어떤 그룹에도 소속되지 않은(tb_device_user에 없는) 미할당 차량 목록을 추출하여 UNION 합산
+*/
+
+WITH user_groups AS (
+    SELECT 
+        du.sensor_id AS sensor_id, 
+        gm.group_nm AS group_nm
+    FROM violet.tb_device_user du
+    LEFT JOIN violet.tb_users u 
+        ON du.user_id = u.user_id
+    LEFT JOIN violet.tb_group_mgmt gm 
+        ON u.group_id::int = gm.id
+    WHERE du.user_id IN (
+        SELECT user_id FROM violet.tb_users WHERE role_id = 'ROLE_GROUP'
+    )
+)
+SELECT
+    v.vehicle_id as "차량 ID", -- 다국어 locale 대상 (ja: 車両 ID, de: Fahrzeug ID, en: Vehicle ID)
+    v.specification as "사양", -- 다국어 locale 대상 (ja: 仕様, de: Spezifikation, en: Specification)
+    v.model as "모델", -- 다국어 locale 대상 (ja: モデル, de: Modell, en: Model)
+    v.function_limit as "기능 제한", -- 다국어 locale 대상 (ja: 機能制限, de: Funktionsbegrenzung, en: Function Limit)
+    g.group_nm as "그룹명", -- 다국어 locale 대상 (ja: グループ名, de: Gruppenname, en: Group Name)
+    v.vehicle_id 
+FROM violet.tb_device_user du
+LEFT JOIN vehicle_info v
+    ON v.vehicle_id = du.sensor_id
+LEFT JOIN user_groups g
+    ON v.vehicle_id = g.sensor_id
+WHERE du.user_id IN (
+    SELECT user_id
+    FROM violet.fn_get_group_hierarchy_with_users_new('${PORTAL_USER_ID.results[0][0]}')
+)
+	AND v.vehicle_id is not null
+UNION 
+SELECT
+    v.vehicle_id as "차량 ID",
+    v.specification as "사양",
+    v.model as "모델",
+    v.function_limit as "기능 제한",
+    g.group_nm as "그룹명",
+    v.vehicle_id
+FROM vehicle_info v
+LEFT JOIN user_groups g
+    ON v.vehicle_id = g.sensor_id
+WHERE v.vehicle_id NOT IN (
+    SELECT distinct du.sensor_id
+    FROM violet.tb_device_user du
+)
+	AND v.vehicle_id is not null
+ORDER BY 1
+;
+
+
+/* ==================================================
+[사양 관리] 7. 사양 정보 조회
+==================================================
+*/
+
+-- --------------------------------------------------
+-- 7.1 사양 마스터 목록 조회
+-- --------------------------------------------------
+select 
+	distinct(specification) as "{% if locale == 'ja' %}仕様{% elif locale == 'de' %}Spezifikation{% elif locale == 'ko' %}사양{% else %}Specification{% endif %}",
+	specification
+from specification_info
+order by specification
+;
+
+-- --------------------------------------------------
+-- 7.2 특정 사양(${hidden_1})에 맵핑된 키 ID 및 임계값 조건 조회
+-- --------------------------------------------------
+select  
+	key_id as "{% if locale == 'ja' %}キーID{% elif locale == 'de' %}Schlüssel ID{% elif locale == 'ko' %}키 ID{% else %}Key ID{% endif %}", 
+	threshold_sign as "{% if locale == 'ja' %}しきい値符号{% elif locale == 'de' %}Schwellenschild{% elif locale == 'ko' %}임계값 기호{% else %}Threshold Sign{% endif %}",  
+	threshold as "{% if locale == 'ja' %}しきい値{% elif locale == 'de' %}Schwelle{% elif locale == 'ko' %}한계점{% else %}Threshold{% endif %}", concat(specification, key_id) as id
+from specification_info
+where specification = '${hidden_1}'
+order by key_id
+;
+
+
+/* ==================================================
+[데이터 관리] 8. 데이터 관리 조회
+==================================================
+*/
+
+-- --------------------------------------------------
+-- 8.1 기본 데이터 조회 
+-- --------------------------------------------------
+SELECT 
+	data_id as "{% if locale == 'ja' %}データ ID{% elif locale == 'de' %}Daten ID{% elif locale == 'ko' %}데이터 ID{% else %}Data ID{% endif %}", 
+	min_value as "{% if locale == 'ja' %}最小値{% elif locale == 'de' %}Mindestwert{% elif locale == 'ko' %}최소값{% else %}Min Value{% endif %}", 
+	max_value as "{% if locale == 'ja' %}最大値{% elif locale == 'de' %}Maximalerwert{% elif locale == 'ko' %}최대값{% else %}Max Vaule{% endif %}", 
+	data_jpn as "{% if locale == 'ja' %}データ(日本語){% elif locale == 'de' %}Daten(Japanisch){% elif locale == 'ko' %}데이터(일본어){% else %}Data(JPN){% endif %}", 
+	data_eng as "{% if locale == 'ja' %}データ(英語){% elif locale == 'de' %}Daten(Englisch){% elif locale == 'ko' %}데이터(영어){% else %}Data(ENG){% endif %}", 
+	data_deu as "{% if locale == 'ja' %}データ(ドイツ語){% elif locale == 'de' %}Daten(Deutsch){% elif locale == 'ko' %}데이터(독일어){% else %}Data(DEU){% endif %}",
+	data_id
+FROM base_data_info
+ORDER BY data_id
+;
+
+-- --------------------------------------------------
+-- 8.2 특정 데이터 ID(${data_id})에 대한 상세 정보 조회
+-- --------------------------------------------------
+SELECT 
+	data_id as "{% if locale == 'ja' %}データ ID{% elif locale == 'de' %}Daten ID{% elif locale == 'ko' %}데이터 ID{% else %}Data ID{% endif %}", 
+	data_detail_id as "{% if locale == 'ja' %}データ詳細 ID{% elif locale == 'de' %}Datendetail ID{% elif locale == 'ko' %}데이터 상세 ID{% else %}Data Detail ID{% endif %}", 
+	byte as "{% if locale == 'ja' %}バイト数{% elif locale == 'de' %}Byte{% elif locale == 'ko' %}바이트{% else %}Byte{% endif %}", 
+	rule as "{% if locale == 'ja' %}ルール{% elif locale == 'de' %}Regel{% elif locale == 'ko' %}규칙{% else %}Rule{% endif %}", 
+	value as "{% if locale == 'ja' %}値{% elif locale == 'de' %}Wert{% elif locale == 'ko' %}값{% else %}Value{% endif %}", 
+	data_detail_jpn as "{% if locale == 'ja' %}データ詳細(日本語){% elif locale == 'de' %}Datendetails(Japanisch){% elif locale == 'ko' %}데이터 상세(일본어){% else %}Data Detail(JPN){% endif %}", 
+	data_detail_eng as "{% if locale == 'ja' %}データ詳細(英語){% elif locale == 'de' %}Datendetails(Englisch){% elif locale == 'ko' %}데이터 상세(영어){% else %}Data Detail(ENG){% endif %}", 
+	data_detail_deu as "{% if locale == 'ja' %}データ詳細(ドイツ語){% elif locale == 'de' %}Datendetails(Deutsch){% elif locale == 'ko' %}데이터 상세(독일어){% else %}Data Detail(DEU){% endif %}", 
+	concat(data_id, data_detail_id) as id
+FROM detail_data_info
+WHERE data_id = '${data_id}'
+ORDER BY data_id, data_detail_id
+;
+
+
+/* ==================================================
+[차량 권한 관리] 9. 차량 권한 관리 조회
+==================================================
+*/
+
+-- --------------------------------------------------
+-- 9.1 로그인 유저가 제어 권한을 가진 상하위 그룹 계층(Hierarchy) 조회
+-- --------------------------------------------------
+select 
+	distinct(group_nm) as "{% if locale == 'ja' %}グループ名{% elif locale == 'de' %}Gruppenname{% elif locale == 'ko' %}그룹명{% else %}Group Name{% endif %}", 
+	role_id as "{% if locale == 'ja' %}ロールID{% elif locale == 'de' %}Rollen ID{% elif locale == 'ko' %}역할 ID{% else %}Role ID{% endif %}", 	
+	parent_group_nm as "{% if locale == 'ja' %}親グループ名{% elif locale == 'de' %}Name Der Ubergeordneten Gruppe{% elif locale == 'ko' %}상위 그룹 이름{% else %}Parent Group Name{% endif %}", 
+	group_nm, id, role_id 
+from violet.fn_get_group_hierarchy_with_users_new('${PORTAL_USER_ID.results[0][0]}')
+order by parent_group_nm, group_nm,  role_id
+;
+
+-- --------------------------------------------------
+-- 9.2 선택한 특정 그룹(${area_1.id}) 소유의 차량 센서 ID 목록 조회
+-- --------------------------------------------------
+SELECT 
+    sensor_id
+FROM violet.tb_device_user
+where user_id in 
+(
+    select user_id from violet.fn_get_group_hierarchy_with_users_new('${PORTAL_USER_ID.results[0][0]}')
+    where id = ${area_1.id}
+)
+;
+
+
+/* ==================================================
+[공지 관리] 10. 전체 시스템 및 긴급 공지 사항 조회
+==================================================
+*/
+
+select *
+from notice_data
+;
+
+
+/* ==================================================
+[예외 차량 권한 관리] 11. 표준 권한 외 사용자별 특수(예외) 차량 맵핑 관리
+==================================================
+*/
+
+-- --------------------------------------------------
+-- 11.1 관리자 권한 이하의 하위 사용자 목록 및 권한 정보 조회
+-- --------------------------------------------------
+select 
+	user_id as "{% if locale == 'ja' %}ユーザーID{% elif locale == 'de' %}Benutzer ID{% elif locale == 'ko' %}사용자 ID{% else %}User ID{% endif %}",
+	role_id as "{% if locale == 'ja' %}権限{% elif locale == 'de' %}Behörde{% elif locale == 'ko' %}권한{% else %}Authority{% endif %}", 	
+	group_nm as "{% if locale == 'ja' %}グループ名{% elif locale == 'de' %}Gruppenname{% elif locale == 'ko' %}그룹명{% else %}Group Name{% endif %}",
+ user_id as user, id, role_id 
+from violet.fn_get_group_hierarchy_with_users_new('${PORTAL_USER_ID.results[0][0]}')
+where user_id is not null
+order by user_id
+;
+
+-- --------------------------------------------------
+-- 11.2 선택한 사용자(${area_1.user})에게 부여된 개별 예외 차량(Exclusive Sensor) ID 조회
+-- --------------------------------------------------
+SELECT sensor_id
+FROM violet.tb_device_user_exc
+where user_id = '${area_1.user}'
+;

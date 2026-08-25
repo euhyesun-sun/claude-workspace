@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "habit-tracker",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "habit-tracker"],
+      "port": 5173
+    },
+    {
+      "name": "baroness-report",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "baroness-report"],
+      "port": 3000
+    }
+  ]
+}
